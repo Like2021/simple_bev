@@ -8,6 +8,8 @@ from nets.segnet import Segnet
 import utils.misc
 import utils.improc
 import utils.vox
+import utils.basic
+import utils.geom
 import random
 import nuscenesdataset 
 import torch
@@ -252,14 +254,14 @@ def main(
         do_val=True,
         val_freq=100,
         save_freq=1000,
-        batch_size=8,
+        batch_size=1,
         grad_acc=5,
         lr=3e-4,
         use_scheduler=True,
         weight_decay=1e-7,
         nworkers=12,
         # data/log/save/load directories
-        data_dir='../nuscenes/',
+        data_dir='../data/nuScenes/',
         log_dir='logs_nuscenes_bevseg',
         ckpt_dir='checkpoints/',
         keep_latest=1,
@@ -282,9 +284,9 @@ def main(
         do_rgbcompress=True,
         do_shuffle_cams=True,
         # cuda
-        device_ids=[0,1,2,3],
+        device_ids=[0],
     ):
-
+    torch.cuda.empty_cache()
     B = batch_size
     assert(B % len(device_ids) == 0) # batch size must be divisible by number of gpus
     if grad_acc > 1:

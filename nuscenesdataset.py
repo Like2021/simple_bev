@@ -1251,7 +1251,7 @@ def compile_data(version, dataroot, data_aug_conf, centroid, bounds, res_3d, bsz
     else:
         print('loading nuscenes...')
         nusc = NuScenes(version='v1.0-{}'.format(version),
-                        dataroot=os.path.join(dataroot, version),
+                        dataroot=dataroot,
                         verbose=False)
     print('making parser...')
     traindata = VizData(
