@@ -254,18 +254,18 @@ def main(
         do_val=True,
         val_freq=100,
         save_freq=1000,
-        batch_size=1,
+        batch_size=2,
         grad_acc=5,
         lr=3e-4,
         use_scheduler=True,
         weight_decay=1e-7,
-        nworkers=12,
+        nworkers=0,
         # data/log/save/load directories
-        data_dir='../data/nuScenes/',
+        data_dir='../Fast-BEV/data/nuscenes/',
         log_dir='logs_nuscenes_bevseg',
         ckpt_dir='checkpoints/',
         keep_latest=1,
-        init_dir='',
+        init_dir='checkpoints/2x5_3e-4s_debug_23:38:48/',
         ignore_load=None,
         load_step=False,
         load_optimizer=False,
@@ -276,7 +276,7 @@ def main(
         ncams=6,
         nsweeps=3,
         # model
-        encoder_type='res101',
+        encoder_type='Like',
         use_radar=False,
         use_radar_filters=False,
         use_lidar=False,
@@ -284,7 +284,7 @@ def main(
         do_rgbcompress=True,
         do_shuffle_cams=True,
         # cuda
-        device_ids=[0],
+        device_ids=[0, 1],
     ):
     torch.cuda.empty_cache()
     B = batch_size
@@ -361,6 +361,7 @@ def main(
 
     # set up model & seg loss
     seg_loss_fn = SimpleLoss(2.13).to(device) # value from lift-splat
+    # model = LikeModel(Z, Y, X, vox_util, do_rgbcompress=do_rgbcompress, rand_flip=rand_flip)
     model = Segnet(Z, Y, X, vox_util, use_radar=use_radar, use_lidar=use_lidar, use_metaradar=use_metaradar, do_rgbcompress=do_rgbcompress, encoder_type=encoder_type, rand_flip=rand_flip)
     model = model.to(device)
     model = torch.nn.DataParallel(model, device_ids=device_ids)
@@ -376,13 +377,14 @@ def main(
     global_step = 0
     if init_dir:
         if load_step and load_optimizer:
-            global_step = saverloader.load(init_dir, model.module, optimizer, ignore_load=ignore_load)
+            global_step = saverloader.load(init_dir, model.module, optimizer, ignore_load=ignore_load, device_ids=device_ids)
         elif load_step:
-            global_step = saverloader.load(init_dir, model.module, ignore_load=ignore_load)
+            global_step = saverloader.load(init_dir, model.module, ignore_load=ignore_load, device_ids=device_ids)
         else:
-            _ = saverloader.load(init_dir, model.module, ignore_load=ignore_load)
+            _ = saverloader.load(init_dir, model.module, ignore_load=ignore_load, device_ids=device_ids)
             global_step = 0
     requires_grad(parameters, True)
+    # optimizer.param_groups[0]['capturable'] = True
     model.train()
 
     # set up running logging pools
@@ -520,8 +522,9 @@ def main(
             model.train()
         
         # save model checkpoint
-        if np.mod(global_step, save_freq)==0:
+        if np.mod(global_step, save_freq) == 0:
             saverloader.save(ckpt_dir, optimizer, model.module, global_step, keep_latest=keep_latest)
+            torch.save(model.state_dict(), f'{global_step}.pth')
         
         # log lr and time
         current_lr = optimizer.param_groups[0]['lr']

@@ -241,6 +241,7 @@ def run_model(loader, index, model, d, img_dir, device='cuda:0', sw=None):
 
         seg_e_t = torch.sigmoid(F.interpolate(seg_bev_e, (mH, mW)))
         seg_e_t_onmap = map_vis * (1-seg_e_t) + blue_img * seg_e_t
+        # seg_e_t_onmap = blue_img * seg_e_t
 
         # save to folder
         folder_name = os.path.join(img_dir, "sample_vis_%03d" % index)
@@ -281,26 +282,26 @@ def main(
         timesteps=40, # a sequence is typically 40 frames (20s * 2fps)
         nworkers=12,
         # data/log/save/load directories
-        data_dir='../nuscenes/',
+        data_dir='../Fast-BEV/data/nuscenes/',
         log_dir='logs_nuscenes_bevseg',
-        img_dir='vis',
+        img_dir='vis/res50_res18',
         ckpt_dir='checkpoints/',
         keep_latest=1,
-        init_dir='',
+        init_dir='checkpoints/res50_res18',
         ignore_load=None,
         # data
         res_scale=2,
         ncams=6,
         nsweeps=3,
         # model
-        encoder_type='res101',
+        encoder_type='Like',
         use_radar=False,
         use_radar_filters=False,
         use_lidar=False,
         use_metaradar=False,
         do_rgbcompress=True,
         # cuda
-        device_ids=[0], # 1 device only for now
+        device_ids=[1], # 1 device only for now
         ):
 
     B = batch_size

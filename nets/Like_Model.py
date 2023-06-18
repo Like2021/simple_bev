@@ -1,29 +1,25 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import sys
-sys.path.append("..")
-
+sys.path.append("")
 import utils.geom
 import utils.vox
 import utils.misc
 import utils.basic
-
+import torch
+import torch.nn as nn
+from nets.ConvNeXt_block import convnext_tiny
 from torchvision.models.resnet import resnet18
-from efficientnet_pytorch import EfficientNet
-import torchvision
-from nets.Like_Model import LikeEncode
+from nets.VAN import Attention
 from nets.RepLK_block import create_RepLKNet31B
 
 EPS = 1e-4
 
-from functools import partial
 
 def set_bn_momentum(model, momentum=0.1):
     for m in model.modules():
         if isinstance(m, (nn.InstanceNorm1d, nn.InstanceNorm2d, nn.InstanceNorm3d)):
             m.momentum = momentum
+
 
 class UpsamplingConcat(nn.Module):
     def __init__(self, in_channels, out_channels, scale_factor=2):
@@ -45,6 +41,7 @@ class UpsamplingConcat(nn.Module):
         x_to_upsample = torch.cat([x, x_to_upsample], dim=1)
         return self.conv(x_to_upsample)
 
+
 class UpsamplingAdd(nn.Module):
     def __init__(self, in_channels, out_channels, scale_factor=2):
         super().__init__()
@@ -56,7 +53,124 @@ class UpsamplingAdd(nn.Module):
 
     def forward(self, x, x_skip):
         x = self.upsample_layer(x)
-        return x + x_skip
+        new_x = x + x_skip
+        return new_x
+
+
+
+
+
+class Up(nn.Module):
+    def __init__(self, in_channels, out_channels, scale_factor=2):
+        super().__init__()
+
+        self.upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x_to_upsample, x):
+        x_to_upsample = self.upsample(x_to_upsample)
+        x_to_upsample = torch.cat([x, x_to_upsample], dim=1)
+        return self.conv(x_to_upsample)
+
+
+class LikeEncode(nn.Module):
+    def __init__(self, C):
+        super(LikeEncode, self).__init__()
+        self.C = C
+        backbone = convnext_tiny(pretrained=True)
+        self.downsample_layers = backbone.downsample_layers
+        self.stages = backbone.stages
+        self.channels = [96, 192, 384, 768]
+        self.lka_attention1 = Attention(self.channels[0])
+        self.lka_attention2 = Attention(self.channels[1])
+        self.up = Up(384+192, 512)
+        self.conv = nn.Conv2d(512, self.C, kernel_size=1, padding=0)
+
+    def get_features(self, x):
+        # 保存特征图尺寸变化的层输出
+        endpoints = dict()
+
+        # 遍历stem下采样+stage
+        for i in range(3):
+            x = self.downsample_layers[i](x)
+            if i == 0:
+                x = self.lka_attention1(x)
+            if i == 1:
+                x = self.lka_attention2(x)
+            x = self.stages[i](x)
+
+            # 下采样1次之后保存
+            endpoints['reduction_{}'.format(len(endpoints) + 1)] = x
+
+        # 上采样+拼接
+        x = self.up(endpoints['reduction_3'], endpoints['reduction_2'])  # (512, 28, 50)
+
+        return x
+
+    def forward(self, x):
+            x = self.get_features(x)
+            x = self.conv(x)  # (128, 28, 50)
+
+            return x
+
+
+class RepLKNetBevEncode(nn.Module):
+    def __init__(self, inC, outC):
+        super(RepLKNetBevEncode, self).__init__()
+        trunk = resnet18(pretrained=False, zero_init_residual=True)
+        self.conv1 = nn.Conv2d(inC, 64, kernel_size=7, stride=2, padding=3,
+                               bias=False)
+        self.bn1 = trunk.bn1
+        self.relu = trunk.relu
+
+        # ResNet-18的block
+        self.layer1 = trunk.layer1
+        self.layer2 = trunk.layer2
+
+        backbone = create_RepLKNet31B(small_kernel_merged=False)
+
+        self.stage1 = backbone.stages[0]
+        self.trans1 = backbone.transitions[0]
+
+        self.up1 = Up(64+256, 256, scale_factor=4)
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear',
+                              align_corners=True),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, outC, kernel_size=1, padding=0),
+        )
+
+    def forward(self, x):
+        # 下采样层，1/2
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        # resnet-18的两个编码层
+        x1 = self.layer1(x)
+
+        # 这个层会将尺寸图变成输入的1/4
+        x = self.layer2(x1)
+
+        x = self.stage1(x)
+        # 1/8
+        x = self.trans1(x)
+
+        x = self.up1(x, x1)
+        x = self.up2(x)
+
+        return x
+
 
 class Decoder(nn.Module):
     def __init__(self, in_channels, n_classes, predict_future_flow):
@@ -65,13 +179,14 @@ class Decoder(nn.Module):
         self.first_conv = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = backbone.bn1
         self.relu = backbone.relu
-
-        backbone1 = create_RepLKNet31B(small_kernel_merged=False)
-        self.stage1 = backbone1.stages[0]
-        self.trans1 = backbone1.transitions[0]
         self.layer1 = backbone.layer1
         self.layer2 = backbone.layer2
         # self.layer3 = backbone.layer3
+        # 用RepLK block代替
+        backbone1 = create_RepLKNet31B(small_kernel_merged=False)
+        self.stage1 = backbone1.stages[0]
+        self.trans1 = backbone1.transitions[0]
+
         self.predict_future_flow = predict_future_flow
 
         shared_out_channels = in_channels
@@ -131,9 +246,8 @@ class Decoder(nn.Module):
         # (H/8, W/8)
         x = self.stage1(x)  # (256, 25, 25)
         x = self.trans1(x)
-        # x = self.layer3(x)
 
-        # First upsample to (H/4, W/4)
+        #  First upsample to (H/4, W/4)
         x = self.up3_skip(x, skip_x['3'])  # (128, 50, 50)
 
         # Second upsample to (H/2, W/2)
@@ -144,7 +258,7 @@ class Decoder(nn.Module):
 
         if bev_flip_indices is not None:
             bev_flip1_index, bev_flip2_index = bev_flip_indices
-            x[bev_flip2_index] = torch.flip(x[bev_flip2_index], [-2]) # note [-2] instead of [-3], since Y is gone now
+            x[bev_flip2_index] = torch.flip(x[bev_flip2_index], [-2])  # note [-2] instead of [-3], since Y is gone now
             x[bev_flip1_index] = torch.flip(x[bev_flip1_index], [-1])
 
         feat_output = self.feat_head(x)
@@ -164,206 +278,37 @@ class Decoder(nn.Module):
         }
 
 
-class Encoder_res101(nn.Module):
-    def __init__(self, C):
-        super().__init__()
-        self.C = C
-        resnet = torchvision.models.resnet101(pretrained=True)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-4])
-        self.layer3 = resnet.layer3
-
-        self.depth_layer = nn.Conv2d(512, self.C, kernel_size=1, padding=0)
-        self.upsampling_layer = UpsamplingConcat(1536, 512)
-
-    def forward(self, x):
-        x1 = self.backbone(x)
-        x2 = self.layer3(x1)
-        x = self.upsampling_layer(x2, x1)
-        x = self.depth_layer(x)
-
-        return x
-
-
-class Encoder_res50(nn.Module):
-    def __init__(self, C):
-        super().__init__()
-        self.C = C
-        resnet = torchvision.models.resnet50(pretrained=True)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-4])
-        self.layer3 = resnet.layer3
-
-        self.depth_layer = nn.Conv2d(512, self.C, kernel_size=1, padding=0)
-        self.upsampling_layer = UpsamplingConcat(1536, 512)
-
-    def forward(self, x):
-        x1 = self.backbone(x)
-        x2 = self.layer3(x1)
-        x = self.upsampling_layer(x2, x1)
-        x = self.depth_layer(x)
-
-        return x
-
-
-class Encoder_eff(nn.Module):
-    def __init__(self, C, version='b4'):
-        super().__init__()
-        self.C = C
-        self.downsample = 8
-        self.version = version
-
-        if self.version == 'b0':
-            self.backbone = EfficientNet.from_pretrained('efficientnet-b0')
-        elif self.version == 'b4':
-            self.backbone = EfficientNet.from_pretrained('efficientnet-b4')
-        self.delete_unused_layers()
-
-        if self.downsample == 16:
-            if self.version == 'b0':
-                upsampling_in_channels = 320 + 112
-            elif self.version == 'b4':
-                upsampling_in_channels = 448 + 160
-            upsampling_out_channels = 512
-        elif self.downsample == 8:
-            if self.version == 'b0':
-                upsampling_in_channels = 112 + 40
-            elif self.version == 'b4':
-                upsampling_in_channels = 160 + 56
-            upsampling_out_channels = 128
-        else:
-            raise ValueError(f'Downsample factor {self.downsample} not handled.')
-
-        self.upsampling_layer = UpsamplingConcat(upsampling_in_channels, upsampling_out_channels)
-        self.depth_layer = nn.Conv2d(upsampling_out_channels, self.C, kernel_size=1, padding=0)
-
-    def delete_unused_layers(self):
-        indices_to_delete = []
-        for idx in range(len(self.backbone._blocks)):
-            if self.downsample == 8:
-                if self.version == 'b0' and idx > 10:
-                    indices_to_delete.append(idx)
-                if self.version == 'b4' and idx > 21:
-                    indices_to_delete.append(idx)
-
-        for idx in reversed(indices_to_delete):
-            del self.backbone._blocks[idx]
-
-        del self.backbone._conv_head
-        del self.backbone._bn1
-        del self.backbone._avg_pooling
-        del self.backbone._dropout
-        del self.backbone._fc
-
-    def get_features(self, x):
-        # Adapted from https://github.com/lukemelas/EfficientNet-PyTorch/blob/master/efficientnet_pytorch/model.py#L231
-        endpoints = dict()
-
-        # Stem
-        x = self.backbone._swish(self.backbone._bn0(self.backbone._conv_stem(x)))
-        prev_x = x
-
-        # Blocks
-        for idx, block in enumerate(self.backbone._blocks):
-            drop_connect_rate = self.backbone._global_params.drop_connect_rate
-            if drop_connect_rate:
-                drop_connect_rate *= float(idx) / len(self.backbone._blocks)
-            x = block(x, drop_connect_rate=drop_connect_rate)
-            if prev_x.size(2) > x.size(2):
-                endpoints['reduction_{}'.format(len(endpoints) + 1)] = prev_x
-            prev_x = x
-
-            if self.downsample == 8:
-                if self.version == 'b0' and idx == 10:
-                    break
-                if self.version == 'b4' and idx == 21:
-                    break
-
-        # Head
-        endpoints['reduction_{}'.format(len(endpoints) + 1)] = x
-
-        if self.downsample == 16:
-            input_1, input_2 = endpoints['reduction_5'], endpoints['reduction_4']
-        elif self.downsample == 8:
-            input_1, input_2 = endpoints['reduction_4'], endpoints['reduction_3']
-        # print('input_1', input_1.shape)
-        # print('input_2', input_2.shape)
-        x = self.upsampling_layer(input_1, input_2)
-        # print('x', x.shape)
-        return x
-
-    def forward(self, x):
-        x = self.get_features(x)  # get feature vector
-        x = self.depth_layer(x)  # feature and depth head
-        return x
-
-
-class Segnet(nn.Module):
-    def __init__(self, Z, Y, X, vox_util=None, 
+class LikeModel(nn.Module):
+    def __init__(self, Z, Y, X, vox_util=None,
                  use_radar=False,
                  use_lidar=False,
                  use_metaradar=False,
-                 do_rgbcompress=True,
+                 do_rgbcompress=False,
                  rand_flip=False,
-                 latent_dim=128,
-                 encoder_type="res101"):
-        super(Segnet, self).__init__()
-        assert (encoder_type in ["res101", "res50", "effb0", "effb4", "Like"])
-
+                 latent_dim=128):
+        super(LikeModel, self).__init__()
+        # The size of voxel grid
         self.Z, self.Y, self.X = Z, Y, X
         self.use_radar = use_radar
         self.use_lidar = use_lidar
         self.use_metaradar = use_metaradar
-        self.do_rgbcompress = do_rgbcompress   
         self.rand_flip = rand_flip
         self.latent_dim = latent_dim
-        self.encoder_type = encoder_type
+        self.do_rgbcompress = do_rgbcompress
+        self.mean = torch.as_tensor([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1).float().cuda()
+        self.std = torch.as_tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1).float().cuda()
 
-        self.mean = torch.as_tensor([0.485, 0.456, 0.406]).reshape(1,3,1,1).float().cuda()
-        self.std = torch.as_tensor([0.229, 0.224, 0.225]).reshape(1,3,1,1).float().cuda()
-        
         # Encoder
         self.feat2d_dim = feat2d_dim = latent_dim
-        if encoder_type == "res101":
-            self.encoder = Encoder_res101(feat2d_dim)
-        elif encoder_type == "res50":
-            self.encoder = Encoder_res50(feat2d_dim)
-        elif encoder_type == "effb0":
-            self.encoder = Encoder_eff(feat2d_dim, version='b0')
-        elif encoder_type == "Like":
-            self.encoder = LikeEncode(feat2d_dim)
-        else:
-            # effb4
-            self.encoder = Encoder_eff(feat2d_dim, version='b4')
+        # 修改成自己的图像视图编码器
+        self.encoder = LikeEncode(C=feat2d_dim)
 
-        # BEV compressor
-        if self.use_radar:
-            if self.use_metaradar:
-                self.bev_compressor = nn.Sequential(
-                    nn.Conv2d(feat2d_dim*Y + 16*Y, feat2d_dim, kernel_size=3, padding=1, stride=1, bias=False),
-                    nn.InstanceNorm2d(latent_dim),
-                    nn.GELU(),
-                )
-            else:
-                self.bev_compressor = nn.Sequential(
-                    nn.Conv2d(feat2d_dim*Y+1, feat2d_dim, kernel_size=3, padding=1, stride=1, bias=False),
-                    nn.InstanceNorm2d(latent_dim),
-                    nn.GELU(),
-                )
-        elif self.use_lidar:
+        if self.do_rgbcompress:
             self.bev_compressor = nn.Sequential(
-                nn.Conv2d(feat2d_dim*Y+Y, feat2d_dim, kernel_size=3, padding=1, stride=1, bias=False),
+                nn.Conv2d(feat2d_dim * Y, feat2d_dim, kernel_size=3, padding=1, stride=1, bias=False),
                 nn.InstanceNorm2d(latent_dim),
                 nn.GELU(),
             )
-        else:
-            if self.do_rgbcompress:
-                self.bev_compressor = nn.Sequential(
-                    nn.Conv2d(feat2d_dim*Y, feat2d_dim, kernel_size=3, padding=1, stride=1, bias=False),
-                    nn.InstanceNorm2d(latent_dim),
-                    nn.GELU(),
-                )
-            else:
-                # use simple sum
-                pass
 
         # Decoder
         self.decoder = Decoder(
@@ -376,15 +321,15 @@ class Segnet(nn.Module):
         self.ce_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
         self.center_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
         self.offset_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
-            
-        # set_bn_momentum(self, 0.1)
 
+        # set_bn_momentum(self, 0.1)
+        # 体素网格的生成
         if vox_util is not None:
             self.xyz_memA = utils.basic.gridcloud3d(1, Z, Y, X, norm=False)
             self.xyz_camA = vox_util.Mem2Ref(self.xyz_memA, Z, Y, X, assert_cube=False)
         else:
             self.xyz_camA = None
-        
+
     def forward(self, rgb_camXs, pix_T_cams, cam0_T_camXs, vox_util, rad_occ_mem0=None):
         '''
         B = batch size, S = number of cameras, C = 3, H = img height, W = img width
@@ -398,9 +343,9 @@ class Segnet(nn.Module):
             - (B, 16, Z, Y, X) when use_radar = True, use_metaradar = True
             - (B, 1, Z, Y, X) when use_lidar = True
         '''
-        # 数据预处理之后的输入图像尺寸(2, 6, 3, 448, 800)
+        # 数据预处理之后的输入图像尺寸(B, 6, 3, 448, 800)
         B, S, C, H, W = rgb_camXs.shape
-        assert(C==3)
+        assert (C == 3)
         # reshape tensors
         # reshape方法，__p就是把B和S乘起来，即(B, S) -> (B*S)
         __p = lambda x: utils.basic.pack_seqdim(x, B)
@@ -416,19 +361,19 @@ class Segnet(nn.Module):
         rgb_camXs_ = (rgb_camXs_ + 0.5 - self.mean.to(device)) / self.std.to(device)
         if self.rand_flip:
             B0, _, _, _ = rgb_camXs_.shape
-            self.rgb_flip_index = np.random.choice([0,1], B0).astype(bool)
+            self.rgb_flip_index = np.random.choice([0, 1], B0).astype(bool)
             rgb_camXs_[self.rgb_flip_index] = torch.flip(rgb_camXs_[self.rgb_flip_index], [-1])
 
         # 将图像的B和C相乘之后，输入给encoder
-        # 输出为(B*S, 128, 56, 100)
+        # 输出为(B*S, 128, 28, 50)
         feat_camXs_ = self.encoder(rgb_camXs_)
         if self.rand_flip:
             feat_camXs_[self.rgb_flip_index] = torch.flip(feat_camXs_[self.rgb_flip_index], [-1])
         _, C, Hf, Wf = feat_camXs_.shape
 
-        # 记录采样倍数，Hf/H = 0.125  就是8倍
-        sy = Hf/float(H)
-        sx = Wf/float(W)
+        # 记录采样倍数，Hf/H = 0.0625  就是16倍
+        sy = Hf / float(H)
+        sx = Wf / float(W)
         Z, Y, X = self.Z, self.Y, self.X
 
         # unproject image feature to 3d grid
@@ -436,7 +381,7 @@ class Segnet(nn.Module):
         # 这里提的矩阵都是坐标系转换矩阵
         featpix_T_cams_ = utils.geom.scale_intrinsics(pix_T_cams_, sx, sy)
         if self.xyz_camA is not None:
-            xyz_camA = self.xyz_camA.to(feat_camXs_.device).repeat(B*S,1,1)
+            xyz_camA = self.xyz_camA.to(feat_camXs_.device).repeat(B * S, 1, 1)
         else:
             xyz_camA = None
         # 双线性采样，得到3D体素网格特征
@@ -448,11 +393,11 @@ class Segnet(nn.Module):
         feat_mems = __u(feat_mems_)  # B, S, C, Z, Y, X
 
         mask_mems = (torch.abs(feat_mems) > 0).float()
-        feat_mem = utils.basic.reduce_masked_mean(feat_mems, mask_mems, dim=1) # B, C, Z, Y, X
+        feat_mem = utils.basic.reduce_masked_mean(feat_mems, mask_mems, dim=1)  # B, C, Z, Y, X
 
         if self.rand_flip:
-            self.bev_flip1_index = np.random.choice([0,1], B).astype(bool)
-            self.bev_flip2_index = np.random.choice([0,1], B).astype(bool)
+            self.bev_flip1_index = np.random.choice([0, 1], B).astype(bool)
+            self.bev_flip2_index = np.random.choice([0, 1], B).astype(bool)
             feat_mem[self.bev_flip1_index] = torch.flip(feat_mem[self.bev_flip1_index], [-1])
             feat_mem[self.bev_flip2_index] = torch.flip(feat_mem[self.bev_flip2_index], [-3])
 
@@ -461,30 +406,13 @@ class Segnet(nn.Module):
                 rad_occ_mem0[self.bev_flip2_index] = torch.flip(rad_occ_mem0[self.bev_flip2_index], [-3])
 
         # bev compressing
-        if self.use_radar:
-            assert(rad_occ_mem0 is not None)
-            if not self.use_metaradar:
-                feat_bev_ = feat_mem.permute(0, 1, 3, 2, 4).reshape(B, self.feat2d_dim*Y, Z, X)
-                rad_bev = torch.sum(rad_occ_mem0, 3).clamp(0,1) # squish the vertical dim
-                feat_bev_ = torch.cat([feat_bev_, rad_bev], dim=1)
-                feat_bev = self.bev_compressor(feat_bev_)
-            else:
-                feat_bev_ = feat_mem.permute(0, 1, 3, 2, 4).reshape(B, self.feat2d_dim*Y, Z, X)
-                rad_bev_ = rad_occ_mem0.permute(0, 1, 3, 2, 4).reshape(B, 16*Y, Z, X)
-                feat_bev_ = torch.cat([feat_bev_, rad_bev_], dim=1)
-                feat_bev = self.bev_compressor(feat_bev_)
-        elif self.use_lidar:
-            assert(rad_occ_mem0 is not None)
-            feat_bev_ = feat_mem.permute(0, 1, 3, 2, 4).reshape(B, self.feat2d_dim*Y, Z, X)
-            rad_bev_ = rad_occ_mem0.permute(0, 1, 3, 2, 4).reshape(B, Y, Z, X)
-            feat_bev_ = torch.cat([feat_bev_, rad_bev_], dim=1)
+        # rgb only
+        # 将C*Y压缩到一起，然后再经过压缩变成128
+        if self.do_rgbcompress:
+            feat_bev_ = feat_mem.permute(0, 1, 3, 2, 4).reshape(B, self.feat2d_dim * Y, Z, X)
             feat_bev = self.bev_compressor(feat_bev_)
-        else: # rgb only
-            if self.do_rgbcompress:
-                feat_bev_ = feat_mem.permute(0, 1, 3, 2, 4).reshape(B, self.feat2d_dim*Y, Z, X)
-                feat_bev = self.bev_compressor(feat_bev_)
-            else:
-                feat_bev = torch.sum(feat_mem, dim=3)
+        else:
+            feat_bev = torch.sum(feat_mem, dim=3)
 
         # bev decoder
         out_dict = self.decoder(feat_bev, (self.bev_flip1_index, self.bev_flip2_index) if self.rand_flip else None)
@@ -497,11 +425,3 @@ class Segnet(nn.Module):
 
         return raw_e, feat_e, seg_e, center_e, offset_e
 
-
-if __name__ == "__main__":
-    model = Segnet(200, 8, 200, encoder_type="Like")
-    parm1 = sum(p.numel() for p in model.parameters())
-    parm2 = sum(p.numel() for p in model.decoder.parameters())
-
-    # parm3 = sum(p.numel() for p in model.decoder.stage1.parameters())
-    print(parm1)

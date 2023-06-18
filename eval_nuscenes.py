@@ -243,6 +243,7 @@ def run_model(model, loss_fn, d, device='cuda:0', sw=None):
     seg_bev_e_round = torch.sigmoid(seg_bev_e).round()
     intersection = (seg_bev_e_round*seg_bev_g*valid_bev_g).sum()
     union = ((seg_bev_e_round+seg_bev_g)*valid_bev_g).clamp(0,1).sum()
+    iou = (intersection / (1e-4 + union)).mean()
 
     metrics['intersection'] = intersection.item()
     metrics['union'] = union.item()
@@ -275,26 +276,26 @@ def main(
         log_freq=100,
         shuffle=False,
         dset='trainval', # we will just use val
-        batch_size=8,
-        nworkers=12,
+        batch_size=2,
+        nworkers=0,
         # data/log/load directories
-        data_dir='../nuscenes/',
+        data_dir='../Fast-BEV/data/nuscenes/',
         log_dir='logs_eval_nuscenes_bevseg',
-        init_dir='checkpoints/rgb_model',
+        init_dir='checkpoints/2x5_3e-4s_debug_16:07:57',
         ignore_load=None,
         # data
         res_scale=2,
         ncams=6,
         nsweeps=3,
         # model
-        encoder_type='res101',
+        encoder_type='Like',
         use_radar=False,
         use_radar_filters=False,
         use_lidar=False,
         use_metaradar=False,
         do_rgbcompress=True,
         # cuda
-        device_ids=[4,5,6,7],
+        device_ids=[0, 1],
 ):
     B = batch_size
     assert(B % len(device_ids) == 0) # batch size must be divisible by number of gpus
